@@ -768,7 +768,6 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
   }
   bool firstpix = true;
   for(int visy = cstarty ; visy < cendy ; ++visy){   // current abs pixel row
-    const bool lastrow = visy + 1 == cendy;
     for(int visx = cstartx ; visx < cendx ; ++visx){ // current abs pixel col
       const uint32_t* rgb = (data + (linesize / 4 * visy) + visx);
       // we do *not* exempt already-wiped pixels from palette creation. once
@@ -782,7 +781,6 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
           }else if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
             tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
           }
-          stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
         }else{
           if(firstpix){
             update_rmatrix(rmatrix, txyidx, tam);
@@ -808,18 +806,6 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
           }
           tam[txyidx].state = SPRIXCELL_ANNIHILATED;
         }
-        stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
-      }
-      if(lastrow){
-        bool lastcol = visx + 1 >= begx + lenx;
-        if(lastcol){
-          // if we're opaque, we needn't clear the old cell with a glyph
-          if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
-            if(rmatrix){
-              rmatrix[txyidx] = 0;
-            }
-          }
-        }
       }
       firstpix = false;
       if(rgba_trans_p(*rgb, bargs->transcolor)){
@@ -829,6 +815,15 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
         return -1;
       }
     }
+  }
+  // if we're opaque, we needn't clear the old cell with a glyph
+  if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
+    if(rmatrix){
+      rmatrix[txyidx] = 0;
+    }
+  }
+  if(tam[txyidx].state != SPRIXCELL_OPAQUE_SIXEL){
+    stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
   }
   return 0;
 }
@@ -884,6 +879,7 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
   }
   loginfo("final palette: %u/%u colors", octets, stab->colorregs);
   free_qstate(&qs);
+  // FIXME how do we switch back to _OPAQUE once we've gone _TRANS?
   return 0;
 }
 
@@ -1381,6 +1377,7 @@ int sixel_rebuild(sprixel* s, int ycell, int xcell, uint8_t* auxvec){
     newstate = SPRIXCELL_OPAQUE_SIXEL;
   }
   s->n->tam[s->dimx * ycell + xcell].state = newstate;
+  // FIXME how do we switch back to _OPAQUE once we've gone _TRANS?
   return 1;
 }
 
