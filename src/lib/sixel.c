@@ -746,6 +746,93 @@ build_data_table(qstate* qs, uint32_t colors, sixeltable* stab, const uint32_t* 
   return 0;
 }
 
+// extract the color information from a cell's worth of pixels. the cell is at
+// cell coordinates y/x inside the image. cell dimensions in pixels are
+// cdimy/cdimx. begy/leny/begx/lenx are all pixel geometries.
+static int
+extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
+                         int begy, int begx, int leny, int lenx, int linesize,
+                         const uint32_t* data, tament* tam, const blitterargs* bargs,
+                         sixeltable* stab, qstate* qs, uint32_t* octets){
+  typeof(bargs->u.pixel.spx->needs_refresh) rmatrix = bargs->u.pixel.spx->needs_refresh;
+  const int txyidx = y * ccols + x;
+  const int cstartx = begx + x * cdimx; // starting pixel row for cell
+  const int cstarty = begy + y * cdimy; // starting pixel col for cell
+  int cendy = cstarty + cdimy;      // one past last pixel row for cell
+  if(cendy > begy + leny){
+    cendy = begy + leny;
+  }
+  int cendx = cstartx + cdimx;      // one past last pixel col for cell
+  if(cendx > begx + lenx){
+    cendx = begx + lenx;
+  }
+  bool firstpix = true;
+  for(int visy = cstarty ; visy < cendy ; ++visy){   // current abs pixel row
+    const bool lastrow = visy + 1 == cendy;
+    for(int visx = cstartx ; visx < cendx ; ++visx){ // current abs pixel col
+      const uint32_t* rgb = (data + (linesize / 4 * visy) + visx);
+      // we do *not* exempt already-wiped pixels from palette creation. once
+      // we're done, we'll call sixel_wipe() on these cells. so they remain
+      // one of SPRIXCELL_ANNIHILATED or SPRIXCELL_ANNIHILATED_TRANS.
+      if(tam[txyidx].state != SPRIXCELL_ANNIHILATED && tam[txyidx].state != SPRIXCELL_ANNIHILATED_TRANS){
+        if(rgba_trans_p(*rgb, bargs->transcolor)){
+          if(firstpix){
+            update_rmatrix(rmatrix, txyidx, tam);
+            tam[txyidx].state = SPRIXCELL_TRANSPARENT;
+          }else if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
+            tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+          }
+          stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
+        }else{
+          if(firstpix){
+            update_rmatrix(rmatrix, txyidx, tam);
+            tam[txyidx].state = SPRIXCELL_OPAQUE_SIXEL;
+          }else if(tam[txyidx].state == SPRIXCELL_TRANSPARENT){
+            tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+          }
+        }
+      }else{
+//fprintf(stderr, "TRANS SKIP %d %d %d %d (cell: %d %d)\n", visy, visx, sy, txyidx, sy / cdimy, visx / cdimx);
+        if(rgba_trans_p(*rgb, bargs->transcolor)){
+          if(firstpix){
+            update_rmatrix(rmatrix, txyidx, tam);
+            tam[txyidx].state = SPRIXCELL_ANNIHILATED_TRANS;
+            free(tam[txyidx].auxvector);
+            tam[txyidx].auxvector = NULL;
+          }
+        }else{
+          if(firstpix){
+            update_rmatrix(rmatrix, txyidx, tam);
+            free(tam[txyidx].auxvector);
+            tam[txyidx].auxvector = NULL;
+          }
+          tam[txyidx].state = SPRIXCELL_ANNIHILATED;
+        }
+        stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
+      }
+      if(lastrow){
+        bool lastcol = visx + 1 >= begx + lenx;
+        if(lastcol){
+          // if we're opaque, we needn't clear the old cell with a glyph
+          if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
+            if(rmatrix){
+              rmatrix[txyidx] = 0;
+            }
+          }
+        }
+      }
+      firstpix = false;
+      if(rgba_trans_p(*rgb, bargs->transcolor)){
+        continue;
+      }
+      if(insert_color(qs, *rgb, octets)){
+        return -1;
+      }
+    }
+  }
+  return 0;
+}
+
 // we have a 4096-element array that takes the 4-5-3 MSBs from the RGB
 // comoponents. once it's complete, we might need to either merge some
 // chunks, or expand them, converging towards the available number of
@@ -777,81 +864,11 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
   bargs->u.pixel.spx->needs_refresh = rmatrix;
   for(int y = 0 ; y < crows ; ++y){ // cell row
     for(int x = 0 ; x < ccols ; ++x){ // cell column
-      const int txyidx = y * ccols + x;
-      const int cstartx = begx + x * cdimx; // starting pixel row for cell
-      const int cstarty = begy + y * cdimy; // starting pixel col for cell
-      int cendy = cstarty + cdimy;      // one past last pixel row for cell
-      if(cendy > begy + leny){
-        cendy = begy + leny;
-      }
-      int cendx = cstartx + cdimx;      // one past last pixel col for cell
-      if(cendx > begx + lenx){
-        cendx = begx + lenx;
-      }
-      bool firstpix = true;
-      for(int visy = cstarty ; visy < cendy ; ++visy){   // current abs pixel row
-        const bool lastrow = visy + 1 == cendy;
-        for(int visx = cstartx ; visx < cendx ; ++visx){ // current abs pixel col
-          const uint32_t* rgb = (data + (linesize / 4 * visy) + visx);
-          // we do *not* exempt already-wiped pixels from palette creation. once
-          // we're done, we'll call sixel_wipe() on these cells. so they remain
-          // one of SPRIXCELL_ANNIHILATED or SPRIXCELL_ANNIHILATED_TRANS.
-          if(tam[txyidx].state != SPRIXCELL_ANNIHILATED && tam[txyidx].state != SPRIXCELL_ANNIHILATED_TRANS){
-            if(rgba_trans_p(*rgb, bargs->transcolor)){
-              if(firstpix){
-                update_rmatrix(rmatrix, txyidx, tam);
-                tam[txyidx].state = SPRIXCELL_TRANSPARENT;
-              }else if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
-                tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
-              }
-              stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
-            }else{
-              if(firstpix){
-                update_rmatrix(rmatrix, txyidx, tam);
-                tam[txyidx].state = SPRIXCELL_OPAQUE_SIXEL;
-              }else if(tam[txyidx].state == SPRIXCELL_TRANSPARENT){
-                tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
-              }
-            }
-          }else{
-//fprintf(stderr, "TRANS SKIP %d %d %d %d (cell: %d %d)\n", visy, visx, sy, txyidx, sy / cdimy, visx / cdimx);
-            if(rgba_trans_p(*rgb, bargs->transcolor)){
-              if(firstpix){
-                update_rmatrix(rmatrix, txyidx, tam);
-                tam[txyidx].state = SPRIXCELL_ANNIHILATED_TRANS;
-                free(tam[txyidx].auxvector);
-                tam[txyidx].auxvector = NULL;
-              }
-            }else{
-              if(firstpix){
-                update_rmatrix(rmatrix, txyidx, tam);
-                free(tam[txyidx].auxvector);
-                tam[txyidx].auxvector = NULL;
-              }
-              tam[txyidx].state = SPRIXCELL_ANNIHILATED;
-            }
-            stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
-          }
-          if(lastrow){
-            bool lastcol = visx + 1 >= begx + lenx;
-            if(lastcol){
-              // if we're opaque, we needn't clear the old cell with a glyph
-              if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
-                if(rmatrix){
-                  rmatrix[txyidx] = 0;
-                }
-              }
-            }
-          }
-          firstpix = false;
-          if(rgba_trans_p(*rgb, bargs->transcolor)){
-            continue;
-          }
-          if(insert_color(&qs, *rgb, &octets)){
-            free_qstate(&qs);
-            return -1;
-          }
-        }
+      if(extract_cell_color_table(y, x, ccols, cdimy, cdimx,
+                                  begy, begx, leny, lenx, linesize,
+                                  data, tam, bargs, stab, &qs, &octets)){
+        free_qstate(&qs);
+        return -1;
       }
     }
   }
