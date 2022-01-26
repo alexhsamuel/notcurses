@@ -773,24 +773,8 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
       // we do *not* exempt already-wiped pixels from palette creation. once
       // we're done, we'll call sixel_wipe() on these cells. so they remain
       // one of SPRIXCELL_ANNIHILATED or SPRIXCELL_ANNIHILATED_TRANS.
-      if(tam[txyidx].state != SPRIXCELL_ANNIHILATED && tam[txyidx].state != SPRIXCELL_ANNIHILATED_TRANS){
-        if(rgba_trans_p(*rgb, bargs->transcolor)){
-          if(firstpix){
-            update_rmatrix(rmatrix, txyidx, tam);
-            tam[txyidx].state = SPRIXCELL_TRANSPARENT;
-          }else if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
-            tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
-          }
-        }else{
-          if(firstpix){
-            update_rmatrix(rmatrix, txyidx, tam);
-            tam[txyidx].state = SPRIXCELL_OPAQUE_SIXEL;
-          }else if(tam[txyidx].state == SPRIXCELL_TRANSPARENT){
-            tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
-          }
-        }
-      }else{
-//fprintf(stderr, "TRANS SKIP %d %d %d %d (cell: %d %d)\n", visy, visx, sy, txyidx, sy / cdimy, visx / cdimx);
+      // intentional bitwise or, to avoid dependency
+      if((tam[txyidx].state == SPRIXCELL_ANNIHILATED) | (tam[txyidx].state == SPRIXCELL_ANNIHILATED_TRANS)){
         if(rgba_trans_p(*rgb, bargs->transcolor)){
           if(firstpix){
             update_rmatrix(rmatrix, txyidx, tam);
@@ -805,6 +789,23 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
             tam[txyidx].auxvector = NULL;
           }
           tam[txyidx].state = SPRIXCELL_ANNIHILATED;
+        }
+//fprintf(stderr, "TRANS SKIP %d %d %d %d (cell: %d %d)\n", visy, visx, sy, txyidx, sy / cdimy, visx / cdimx);
+      }else{
+        if(rgba_trans_p(*rgb, bargs->transcolor)){
+          if(firstpix){
+            update_rmatrix(rmatrix, txyidx, tam);
+            tam[txyidx].state = SPRIXCELL_TRANSPARENT;
+          }else if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
+            tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+          }
+        }else{
+          if(firstpix){
+            update_rmatrix(rmatrix, txyidx, tam);
+            tam[txyidx].state = SPRIXCELL_OPAQUE_SIXEL;
+          }else if(tam[txyidx].state == SPRIXCELL_TRANSPARENT){
+            tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+          }
         }
       }
       firstpix = false;
@@ -821,8 +822,7 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
     if(rmatrix){
       rmatrix[txyidx] = 0;
     }
-  }
-  if(tam[txyidx].state != SPRIXCELL_OPAQUE_SIXEL){
+  }else{
     stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
   }
   return 0;
