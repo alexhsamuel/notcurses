@@ -65,6 +65,7 @@ typedef struct qstate {
   unsigned dynnodes_total;
   unsigned onodes_free;
   unsigned onodes_total;
+  uint32_t octets;
 } qstate;
 
 
@@ -113,6 +114,7 @@ alloc_qstate(unsigned colorregs, qstate* qs){
   // we only initialize the static nodes, not the dynamic ones--we know
   // when we pull a dynamic one that it needs its popcount initialized.
   memset(qs->qnodes, 0, sizeof(qnode) * QNODECOUNT);
+  qs->octets = 0;
   return 0;
 }
 
@@ -484,9 +486,6 @@ void sixel_refresh(const ncpile* p, sprixel* s){
 // only be called for the first pixel in each cell.
 static inline void
 update_rmatrix(unsigned char* rmatrix, int txyidx, const tament* tam){
-  if(rmatrix == NULL){
-    return;
-  }
   sprixcell_e state = tam[txyidx].state;
   if(state == SPRIXCELL_TRANSPARENT || state > SPRIXCELL_ANNIHILATED){
     rmatrix[txyidx] = 0;
@@ -598,11 +597,11 @@ choose(qstate* qs, qnode* q, int z, int i, int* hi, int* lo,
 // we must reduce the number of colors until we're using less than or equal
 // to the number of color registers.
 static inline int
-merge_color_table(qstate* qs, uint32_t* colors, uint32_t colorregs){
-  if(*colors == 0){
+merge_color_table(qstate* qs, uint32_t colorregs){
+  if(qs->octets == 0){
     return 0;
   }
-  qnode* qactive = get_active_set(qs, *colors);
+  qnode* qactive = get_active_set(qs, qs->octets);
   if(qactive == NULL){
     return -1;
   }
@@ -611,8 +610,8 @@ merge_color_table(qstate* qs, uint32_t* colors, uint32_t colorregs){
   // (this is not necessarily an optimizing huristic, but it'll do for now).
   unsigned cidx = 0;
 //fprintf(stderr, "colors: %u cregs: %u\n", *colors, colorregs);
-  for(int z = *colors - 1 ; z >= 0 ; --z){
-    if(*colors >= colorregs){
+  for(int z = qs->octets - 1 ; z >= 0 ; --z){
+    if(qs->octets >= colorregs){
       if(cidx == colorregs){
         break; // we just ran out of color registers
       }
@@ -621,7 +620,7 @@ merge_color_table(qstate* qs, uint32_t* colors, uint32_t colorregs){
     ++cidx;
   }
   free(qactive);
-  if(*colors > colorregs){
+  if(qs->octets > colorregs){
     // tend to those which couldn't get a color table entry. we start with two
     // values, lo and hi, initialized to -1. we iterate over the *static* qnodes,
     // descending into onodes to check their qnodes. we thus iterate over all
@@ -652,16 +651,16 @@ merge_color_table(qstate* qs, uint32_t* colors, uint32_t colorregs){
         choose(qs, &qs->qnodes[z], z, -1, &hi, &lo, &hq, &lq);
       }
     }
-    *colors = colorregs;
+    qs->octets = colorregs;
   }
   return 0;
 }
 
 static inline void
-load_color_table(const qstate* qs, uint32_t colors, unsigned char* table){
+load_color_table(const qstate* qs, unsigned char* table){
   uint32_t loaded = 0;
   unsigned total = QNODECOUNT + (qs->dynnodes_total - qs->dynnodes_free);
-  for(unsigned z = 0 ; z < total && loaded < colors ; ++z){
+  for(unsigned z = 0 ; z < total && loaded < qs->octets ; ++z){
     const qnode* q = &qs->qnodes[z];
     if(chosen_p(q)){
       table[CENTSIZE * qidx(q) + 0] = ss(q->q.comps[0]);
@@ -670,8 +669,8 @@ load_color_table(const qstate* qs, uint32_t colors, unsigned char* table){
       ++loaded;
     }
   }
-//fprintf(stderr, "loaded: %u colors: %u\n", loaded, colors);
-  assert(loaded == colors);
+//fprintf(stderr, "loaded: %u colors: %u\n", loaded, qs->octets);
+  assert(loaded == qs->octets);
 }
 
 // get the byte in the actionmap corresponding to a color + sixelrow
@@ -690,7 +689,7 @@ actionmap_bit(int cidx, int colors, int sixelrow){
 // we have converged upon colorregs in the octree. we now run over the pixels
 // once again, and get the actual final color table entries.
 static inline int
-build_data_table(qstate* qs, uint32_t colors, sixeltable* stab, const uint32_t* data,
+build_data_table(qstate* qs, sixeltable* stab, const uint32_t* data,
                  int linesize, int begy, int begx, int leny, int lenx,
                  uint32_t transcolor){
   if(stab->map->sixelcount == 0){
@@ -698,25 +697,25 @@ build_data_table(qstate* qs, uint32_t colors, sixeltable* stab, const uint32_t* 
     return -1;
   }
   // FIXME merge these two
-  size_t dsize = sizeof(*stab->map->data) * colors * stab->map->sixelcount;
+  size_t dsize = sizeof(*stab->map->data) * qs->octets * stab->map->sixelcount;
   stab->map->data = malloc(dsize);
   if(stab->map->data == NULL){
     return -1;
   }
-  size_t tsize = CENTSIZE * colors;
+  size_t tsize = CENTSIZE * qs->octets;
   stab->map->table = malloc(tsize);
   if(stab->map->table == NULL){
     free(stab->map->data);
     stab->map->data = NULL;
     return -1;
   }
-  load_color_table(qs, colors, stab->map->table);
+  load_color_table(qs, stab->map->table);
   memset(stab->map->data, 0, dsize);
-  stab->map->colors = colors;
+  stab->map->colors = qs->octets;
   int pos = 0;
 //fprintf(stderr, "BUILDING DATA TABLE\n");
   // 1 bit per color per sixelrow as a skiptable; if 0, color is absent there
-  size_t actionsize = ((colors * (leny + 5) / 6) + (CHAR_BIT - 1)) / CHAR_BIT;
+  size_t actionsize = ((qs->octets * (leny + 5) / 6) + (CHAR_BIT - 1)) / CHAR_BIT;
   stab->map->action = malloc(actionsize);
   memset(stab->map->action, 0, actionsize);
   int sixelrow = 0;
@@ -736,8 +735,8 @@ build_data_table(qstate* qs, uint32_t colors, sixeltable* stab, const uint32_t* 
           return -1;
         }
         stab->map->data[cidx * stab->map->sixelcount + pos] |= (1u << (sy - visy));
-        stab->map->action[actionmap_offset(cidx, colors, sixelrow)] |=
-          actionmap_bit(cidx, colors, sixelrow);
+        stab->map->action[actionmap_offset(cidx, qs->octets, sixelrow)] |=
+          actionmap_bit(cidx, qs->octets, sixelrow);
       }
       ++pos;
     }
@@ -753,7 +752,7 @@ static int
 extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
                          int begy, int begx, int leny, int lenx, int linesize,
                          const uint32_t* data, tament* tam, const blitterargs* bargs,
-                         sixeltable* stab, qstate* qs, uint32_t* octets){
+                         sixeltable* stab, qstate* qs){
   typeof(bargs->u.pixel.spx->needs_refresh) rmatrix = bargs->u.pixel.spx->needs_refresh;
   const int txyidx = y * ccols + x;
   const int cstartx = begx + x * cdimx; // starting pixel row for cell
@@ -767,44 +766,55 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
     cendx = begx + lenx;
   }
   bool firstpix = true;
+  // we initialize the TAM entry based on the first pixel. if it's transparent,
+  // initialize as transparent, and otherwise as opaque. following that, any
+  // transparent pixel takes opaque to mixed, and any filled pixel takes
+  // transparent to mixed.
+  const uint32_t* rgb = (data + (linesize / 4 * cstarty) + cstartx);
+  if((tam[txyidx].state == SPRIXCELL_ANNIHILATED) || (tam[txyidx].state == SPRIXCELL_ANNIHILATED_TRANS)){
+    if(rgba_trans_p(*rgb, bargs->transcolor)){
+      update_rmatrix(rmatrix, txyidx, tam);
+      tam[txyidx].state = SPRIXCELL_ANNIHILATED_TRANS;
+      free(tam[txyidx].auxvector);
+      tam[txyidx].auxvector = NULL;
+    }else{
+      update_rmatrix(rmatrix, txyidx, tam);
+      free(tam[txyidx].auxvector);
+      tam[txyidx].auxvector = NULL;
+    }
+  }else{
+    if(rgba_trans_p(*rgb, bargs->transcolor)){
+      update_rmatrix(rmatrix, txyidx, tam);
+      tam[txyidx].state = SPRIXCELL_TRANSPARENT;
+    }else{
+      update_rmatrix(rmatrix, txyidx, tam);
+      tam[txyidx].state = SPRIXCELL_OPAQUE_SIXEL;
+    }
+  }
   for(int visy = cstarty ; visy < cendy ; ++visy){   // current abs pixel row
     for(int visx = cstartx ; visx < cendx ; ++visx){ // current abs pixel col
-      const uint32_t* rgb = (data + (linesize / 4 * visy) + visx);
+      rgb = (data + (linesize / 4 * visy) + visx);
       // we do *not* exempt already-wiped pixels from palette creation. once
       // we're done, we'll call sixel_wipe() on these cells. so they remain
       // one of SPRIXCELL_ANNIHILATED or SPRIXCELL_ANNIHILATED_TRANS.
       // intentional bitwise or, to avoid dependency
       if((tam[txyidx].state == SPRIXCELL_ANNIHILATED) | (tam[txyidx].state == SPRIXCELL_ANNIHILATED_TRANS)){
-        if(rgba_trans_p(*rgb, bargs->transcolor)){
-          if(firstpix){
-            update_rmatrix(rmatrix, txyidx, tam);
-            tam[txyidx].state = SPRIXCELL_ANNIHILATED_TRANS;
-            free(tam[txyidx].auxvector);
-            tam[txyidx].auxvector = NULL;
-          }
-        }else{
-          if(firstpix){
-            update_rmatrix(rmatrix, txyidx, tam);
-            free(tam[txyidx].auxvector);
-            tam[txyidx].auxvector = NULL;
-          }
+        if(!rgba_trans_p(*rgb, bargs->transcolor)){
           tam[txyidx].state = SPRIXCELL_ANNIHILATED;
         }
 //fprintf(stderr, "TRANS SKIP %d %d %d %d (cell: %d %d)\n", visy, visx, sy, txyidx, sy / cdimy, visx / cdimx);
       }else{
         if(rgba_trans_p(*rgb, bargs->transcolor)){
-          if(firstpix){
-            update_rmatrix(rmatrix, txyidx, tam);
-            tam[txyidx].state = SPRIXCELL_TRANSPARENT;
-          }else if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
-            tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+          if(!firstpix){
+            if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
+             tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+            }
           }
         }else{
-          if(firstpix){
-            update_rmatrix(rmatrix, txyidx, tam);
-            tam[txyidx].state = SPRIXCELL_OPAQUE_SIXEL;
-          }else if(tam[txyidx].state == SPRIXCELL_TRANSPARENT){
-            tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+          if(!firstpix){
+            if(tam[txyidx].state == SPRIXCELL_TRANSPARENT){
+              tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+            }
           }
         }
       }
@@ -812,16 +822,14 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
       if(rgba_trans_p(*rgb, bargs->transcolor)){
         continue;
       }
-      if(insert_color(qs, *rgb, octets)){
+      if(insert_color(qs, *rgb, &qs->octets)){
         return -1;
       }
     }
   }
   // if we're opaque, we needn't clear the old cell with a glyph
   if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
-    if(rmatrix){
-      rmatrix[txyidx] = 0;
-    }
+    rmatrix[txyidx] = 0;
   }else{
     stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
   }
@@ -837,7 +845,6 @@ static inline int
 extract_color_table(const uint32_t* data, int linesize, int ccols,
                     int leny, int lenx, sixeltable* stab,
                     tament* tam, const blitterargs* bargs){
-  uint32_t octets = 0;
   qstate qs;
   if(alloc_qstate(bargs->u.pixel.colorregs, &qs)){
     logerror("couldn't allocate qstate");
@@ -861,23 +868,23 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
     for(int x = 0 ; x < ccols ; ++x){ // cell column
       if(extract_cell_color_table(y, x, ccols, cdimy, cdimx,
                                   begy, begx, leny, lenx, linesize,
-                                  data, tam, bargs, stab, &qs, &octets)){
+                                  data, tam, bargs, stab, &qs)){
         free_qstate(&qs);
         return -1;
       }
     }
   }
-  loginfo("octree got %"PRIu32" entries", octets);
-  if(merge_color_table(&qs, &octets, stab->colorregs)){
+  loginfo("octree got %"PRIu32" entries", qs.octets);
+  if(merge_color_table(&qs, stab->colorregs)){
     free_qstate(&qs);
     return -1;
   }
-  if(build_data_table(&qs, octets, stab, data, linesize, begy, begx, leny, lenx,
+  if(build_data_table(&qs, stab, data, linesize, begy, begx, leny, lenx,
                       bargs->transcolor)){
     free_qstate(&qs);
     return -1;
   }
-  loginfo("final palette: %u/%u colors", octets, stab->colorregs);
+  loginfo("final palette: %u/%u colors", qs.octets, stab->colorregs);
   free_qstate(&qs);
   // FIXME how do we switch back to _OPAQUE once we've gone _TRANS?
   return 0;
