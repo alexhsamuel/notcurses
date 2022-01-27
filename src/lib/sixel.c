@@ -65,7 +65,7 @@ typedef struct qstate {
   unsigned dynnodes_total;
   unsigned onodes_free;
   unsigned onodes_total;
-  uint32_t octets;
+  uint32_t colors;
 } qstate;
 
 
@@ -114,7 +114,7 @@ alloc_qstate(unsigned colorregs, qstate* qs){
   // we only initialize the static nodes, not the dynamic ones--we know
   // when we pull a dynamic one that it needs its popcount initialized.
   memset(qs->qnodes, 0, sizeof(qnode) * QNODECOUNT);
-  qs->octets = 0;
+  qs->colors = 0;
   return 0;
 }
 
@@ -598,10 +598,10 @@ choose(qstate* qs, qnode* q, int z, int i, int* hi, int* lo,
 // to the number of color registers.
 static inline int
 merge_color_table(qstate* qs, uint32_t colorregs){
-  if(qs->octets == 0){
+  if(qs->colors == 0){
     return 0;
   }
-  qnode* qactive = get_active_set(qs, qs->octets);
+  qnode* qactive = get_active_set(qs, qs->colors);
   if(qactive == NULL){
     return -1;
   }
@@ -610,8 +610,8 @@ merge_color_table(qstate* qs, uint32_t colorregs){
   // (this is not necessarily an optimizing huristic, but it'll do for now).
   unsigned cidx = 0;
 //fprintf(stderr, "colors: %u cregs: %u\n", *colors, colorregs);
-  for(int z = qs->octets - 1 ; z >= 0 ; --z){
-    if(qs->octets >= colorregs){
+  for(int z = qs->colors - 1 ; z >= 0 ; --z){
+    if(qs->colors >= colorregs){
       if(cidx == colorregs){
         break; // we just ran out of color registers
       }
@@ -620,7 +620,7 @@ merge_color_table(qstate* qs, uint32_t colorregs){
     ++cidx;
   }
   free(qactive);
-  if(qs->octets > colorregs){
+  if(qs->colors > colorregs){
     // tend to those which couldn't get a color table entry. we start with two
     // values, lo and hi, initialized to -1. we iterate over the *static* qnodes,
     // descending into onodes to check their qnodes. we thus iterate over all
@@ -651,7 +651,7 @@ merge_color_table(qstate* qs, uint32_t colorregs){
         choose(qs, &qs->qnodes[z], z, -1, &hi, &lo, &hq, &lq);
       }
     }
-    qs->octets = colorregs;
+    qs->colors = colorregs;
   }
   return 0;
 }
@@ -660,7 +660,7 @@ static inline void
 load_color_table(const qstate* qs, unsigned char* table){
   uint32_t loaded = 0;
   unsigned total = QNODECOUNT + (qs->dynnodes_total - qs->dynnodes_free);
-  for(unsigned z = 0 ; z < total && loaded < qs->octets ; ++z){
+  for(unsigned z = 0 ; z < total && loaded < qs->colors ; ++z){
     const qnode* q = &qs->qnodes[z];
     if(chosen_p(q)){
       table[CENTSIZE * qidx(q) + 0] = ss(q->q.comps[0]);
@@ -669,8 +669,8 @@ load_color_table(const qstate* qs, unsigned char* table){
       ++loaded;
     }
   }
-//fprintf(stderr, "loaded: %u colors: %u\n", loaded, qs->octets);
-  assert(loaded == qs->octets);
+//fprintf(stderr, "loaded: %u colors: %u\n", loaded, qs->colors);
+  assert(loaded == qs->colors);
 }
 
 // get the byte in the actionmap corresponding to a color + sixelrow
@@ -697,12 +697,12 @@ build_data_table(qstate* qs, sixeltable* stab, const uint32_t* data,
     return -1;
   }
   // FIXME merge these two
-  size_t dsize = sizeof(*stab->map->data) * qs->octets * stab->map->sixelcount;
+  size_t dsize = sizeof(*stab->map->data) * qs->colors * stab->map->sixelcount;
   stab->map->data = malloc(dsize);
   if(stab->map->data == NULL){
     return -1;
   }
-  size_t tsize = CENTSIZE * qs->octets;
+  size_t tsize = CENTSIZE * qs->colors;
   stab->map->table = malloc(tsize);
   if(stab->map->table == NULL){
     free(stab->map->data);
@@ -711,11 +711,11 @@ build_data_table(qstate* qs, sixeltable* stab, const uint32_t* data,
   }
   load_color_table(qs, stab->map->table);
   memset(stab->map->data, 0, dsize);
-  stab->map->colors = qs->octets;
+  stab->map->colors = qs->colors;
   int pos = 0;
 //fprintf(stderr, "BUILDING DATA TABLE\n");
   // 1 bit per color per sixelrow as a skiptable; if 0, color is absent there
-  size_t actionsize = ((qs->octets * (leny + 5) / 6) + (CHAR_BIT - 1)) / CHAR_BIT;
+  size_t actionsize = ((qs->colors * (leny + 5) / 6) + (CHAR_BIT - 1)) / CHAR_BIT;
   stab->map->action = malloc(actionsize);
   memset(stab->map->action, 0, actionsize);
   int sixelrow = 0;
@@ -735,8 +735,8 @@ build_data_table(qstate* qs, sixeltable* stab, const uint32_t* data,
           return -1;
         }
         stab->map->data[cidx * stab->map->sixelcount + pos] |= (1u << (sy - visy));
-        stab->map->action[actionmap_offset(cidx, qs->octets, sixelrow)] |=
-          actionmap_bit(cidx, qs->octets, sixelrow);
+        stab->map->action[actionmap_offset(cidx, qs->colors, sixelrow)] |=
+          actionmap_bit(cidx, qs->colors, sixelrow);
       }
       ++pos;
     }
@@ -822,7 +822,7 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
       if(rgba_trans_p(*rgb, bargs->transcolor)){
         continue;
       }
-      if(insert_color(qs, *rgb, &qs->octets)){
+      if(insert_color(qs, *rgb, &qs->colors)){
         return -1;
       }
     }
@@ -874,7 +874,7 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
       }
     }
   }
-  loginfo("octree got %"PRIu32" entries", qs.octets);
+  loginfo("octree got %"PRIu32" entries", qs.colors);
   if(merge_color_table(&qs, stab->colorregs)){
     free_qstate(&qs);
     return -1;
@@ -884,7 +884,7 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
     free_qstate(&qs);
     return -1;
   }
-  loginfo("final palette: %u/%u colors", qs.octets, stab->colorregs);
+  loginfo("final palette: %u/%u colors", qs.colors, stab->colorregs);
   free_qstate(&qs);
   // FIXME how do we switch back to _OPAQUE once we've gone _TRANS?
   return 0;
