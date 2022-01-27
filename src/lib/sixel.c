@@ -59,6 +59,10 @@ qnode_keys(unsigned r, unsigned g, unsigned b, unsigned *skey){
 }
 
 typedef struct qstate {
+  pthread_mutex_t lock;
+  _Atomic long cellstaken;    // when cellstaken == celly * cellx, block
+  // FIXME probably have to associate this with a condvar
+  _Atomic long cellsfinished; // when cellsfinished == celly * cellx, proceed
   qnode* qnodes;
   onode* onodes;
   unsigned dynnodes_free;
@@ -66,8 +70,32 @@ typedef struct qstate {
   unsigned onodes_free;
   unsigned onodes_total;
   uint32_t colors;
+  // we do multithreaded color extraction. each worker needs be able to
+  // determine the next cell to handle. we start at the upper left, proceed
+  // to the right and then down (FIXME maybe try down and to the right?).
+  // once all have been taken, wait on the engine condvar.
+  int celly, cellx;  // cell dimensions
+  int linesize;      // line length in bytes
+  const blitterargs* bargs;
+  const uint32_t* data;
+  tament* tam;
+  struct sixeltable* stab;
 } qstate;
 
+// we keep a few worker threads spun up to assist with quantization.
+typedef struct sixel_engine {
+  // FIXME we'll want maybe one per core in our cpuset?
+  pthread_t tids[1];
+  unsigned workers;
+  unsigned workers_wanted;
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  qstate *qs; // FIXME need a queue
+  bool done;
+} sixel_engine;
+
+// FIXME make this part of the context, sheesh
+static sixel_engine globsengine;
 
 // have we been chosen for the color table?
 static inline bool
@@ -97,7 +125,7 @@ qidx(const qnode* q){
 // into a situation where we don't have an available dynnode
 // (see insert_color()).
 static int
-alloc_qstate(unsigned colorregs, qstate* qs){
+alloc_qstate(unsigned colorregs, qstate* qs, int crows, int ccols){
   qs->dynnodes_free = colorregs;
   qs->dynnodes_total = qs->dynnodes_free;
   if((qs->qnodes = malloc((QNODECOUNT + qs->dynnodes_total) * sizeof(qnode))) == NULL){
@@ -115,6 +143,11 @@ alloc_qstate(unsigned colorregs, qstate* qs){
   // when we pull a dynamic one that it needs its popcount initialized.
   memset(qs->qnodes, 0, sizeof(qnode) * QNODECOUNT);
   qs->colors = 0;
+  qs->cellstaken = 0;
+  qs->cellsfinished = 0;
+  qs->celly = crows;
+  qs->cellx = ccols;
+  pthread_mutex_init(&qs->lock, NULL);
   return 0;
 }
 
@@ -123,6 +156,7 @@ static void
 free_qstate(qstate *qs){
   if(qs){
     loginfo("freeing qstate");
+    pthread_mutex_destroy(&qs->lock);
     free(qs->qnodes);
     free(qs->onodes);
   }
@@ -224,7 +258,7 @@ find_color(const qstate* qs, uint32_t pixel){
     if(qs->onodes[q->qlink - 1].q[skey]){
       q = qs->onodes[q->qlink - 1].q[skey];
     }else{
-//fprintf(stderr, "OH NOOOOOOOOOO %u:%u QLINK: %u\n", key, skey, q->qlink); // FIXME find one
+fprintf(stderr, "OH NOOOOOOOOOO %u:%u QLINK: %u\n", key, skey, q->qlink); // FIXME find one
       return -1;
     }
   }
@@ -689,9 +723,9 @@ actionmap_bit(int cidx, int colors, int sixelrow){
 // we have converged upon colorregs in the octree. we now run over the pixels
 // once again, and get the actual final color table entries.
 static inline int
-build_data_table(qstate* qs, sixeltable* stab, const uint32_t* data,
-                 int linesize, int begy, int begx, int leny, int lenx,
-                 uint32_t transcolor){
+build_data_table(qstate* qs, sixeltable* stab,
+                 int linesize, int leny, int lenx,
+                 const blitterargs* bargs){
   if(stab->map->sixelcount == 0){
     logerror("no sixels");
     return -1;
@@ -719,15 +753,16 @@ build_data_table(qstate* qs, sixeltable* stab, const uint32_t* data,
   stab->map->action = malloc(actionsize);
   memset(stab->map->action, 0, actionsize);
   int sixelrow = 0;
-  for(int visy = begy ; visy < (begy + leny) ; visy += 6){ // pixel row
-    for(int visx = begx ; visx < (begx + lenx) ; visx += 1){ // pixel column
-      for(int sy = visy ; sy < (begy + leny) && sy < visy + 6 ; ++sy){ // offset within sprixel
-        const uint32_t* rgb = (data + (linesize / 4 * sy) + visx);
-        if(rgba_trans_p(*rgb, transcolor)){
+  for(int visy = bargs->begy ; visy < (bargs->begy + leny) ; visy += 6){ // pixel row
+    for(int visx = bargs->begx ; visx < (bargs->begx + lenx) ; visx += 1){ // pixel column
+      for(int sy = visy ; sy < (bargs->begy + leny) && sy < visy + 6 ; ++sy){ // offset within sprixel
+        const uint32_t* rgb = (qs->data + (linesize / 4 * sy) + visx);
+        if(rgba_trans_p(*rgb, bargs->transcolor)){
           continue;
         }
         int cidx = find_color(qs, *rgb);
         if(cidx < 0){
+fprintf(stderr, "COUDLNT FIND THE COLOR\n");
           free(stab->map->table);
           stab->map->table = NULL;
           free(stab->map->data);
@@ -749,12 +784,22 @@ build_data_table(qstate* qs, sixeltable* stab, const uint32_t* data,
 // cell coordinates y/x inside the image. cell dimensions in pixels are
 // cdimy/cdimx. begy/leny/begx/lenx are all pixel geometries.
 static int
-extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
-                         int begy, int begx, int leny, int lenx, int linesize,
-                         const uint32_t* data, tament* tam, const blitterargs* bargs,
-                         sixeltable* stab, qstate* qs){
+extract_cell_color_table(long cellid, int linesize, qstate* qs){
+  const blitterargs* bargs = qs->bargs;
+  const int cdimx = bargs->u.pixel.cellpxx;
+  const int cdimy = bargs->u.pixel.cellpxy;
+  sixeltable* stab = qs->stab;
+  int ccols = qs->cellx;
+  int begy = bargs->begy;
+  int begx = bargs->begx;
+  int leny = bargs->leny;
+  int lenx = bargs->lenx;
+  int y = cellid / ccols;
+  int x = cellid % ccols;
+//fprintf(stderr, "CELLID %ld y/x: %d/%d cdim: %d/%d\n", cellid, y, x, cdimy, cdimx);
+  tament* tam = qs->tam;
   typeof(bargs->u.pixel.spx->needs_refresh) rmatrix = bargs->u.pixel.spx->needs_refresh;
-  const int txyidx = y * ccols + x;
+  const int txyidx = cellid; //y * ccols + x;
   const int cstartx = begx + x * cdimx; // starting pixel row for cell
   const int cstarty = begy + y * cdimy; // starting pixel col for cell
   int cendy = cstarty + cdimy;      // one past last pixel row for cell
@@ -770,7 +815,9 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
   // initialize as transparent, and otherwise as opaque. following that, any
   // transparent pixel takes opaque to mixed, and any filled pixel takes
   // transparent to mixed.
-  const uint32_t* rgb = (data + (linesize / 4 * cstarty) + cstartx);
+//fprintf(stderr, "DATA: %p linesize: %d cstart: %d/%d txyidx: %d/%d tid: %lu\n", qs->data, linesize, cstarty, cstartx, txyidx, ccols, pthread_self());
+  const uint32_t* rgb = (qs->data + (linesize / 4 * cstarty) + cstartx);
+  pthread_mutex_lock(&qs->lock);
   if((tam[txyidx].state == SPRIXCELL_ANNIHILATED) || (tam[txyidx].state == SPRIXCELL_ANNIHILATED_TRANS)){
     if(rgba_trans_p(*rgb, bargs->transcolor)){
       update_rmatrix(rmatrix, txyidx, tam);
@@ -791,47 +838,74 @@ extract_cell_color_table(int y, int x, int ccols, int cdimy, int cdimx,
       tam[txyidx].state = SPRIXCELL_OPAQUE_SIXEL;
     }
   }
+  pthread_mutex_unlock(&qs->lock);
   for(int visy = cstarty ; visy < cendy ; ++visy){   // current abs pixel row
     for(int visx = cstartx ; visx < cendx ; ++visx){ // current abs pixel col
-      rgb = (data + (linesize / 4 * visy) + visx);
+      rgb = (qs->data + (linesize / 4 * visy) + visx);
       // we do *not* exempt already-wiped pixels from palette creation. once
       // we're done, we'll call sixel_wipe() on these cells. so they remain
       // one of SPRIXCELL_ANNIHILATED or SPRIXCELL_ANNIHILATED_TRANS.
       // intentional bitwise or, to avoid dependency
-      if((tam[txyidx].state == SPRIXCELL_ANNIHILATED) | (tam[txyidx].state == SPRIXCELL_ANNIHILATED_TRANS)){
-        if(!rgba_trans_p(*rgb, bargs->transcolor)){
-          tam[txyidx].state = SPRIXCELL_ANNIHILATED;
-        }
-//fprintf(stderr, "TRANS SKIP %d %d %d %d (cell: %d %d)\n", visy, visx, sy, txyidx, sy / cdimy, visx / cdimx);
-      }else{
-        if(rgba_trans_p(*rgb, bargs->transcolor)){
-          if(!firstpix){
-            if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
-             tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
-            }
+      if(tam[txyidx].state != SPRIXCELL_ANNIHILATED){
+        if(tam[txyidx].state == SPRIXCELL_ANNIHILATED_TRANS){
+          if(!rgba_trans_p(*rgb, bargs->transcolor)){
+            pthread_mutex_lock(&qs->lock);
+            tam[txyidx].state = SPRIXCELL_ANNIHILATED;
+            pthread_mutex_unlock(&qs->lock);
           }
         }else{
           if(!firstpix){
-            if(tam[txyidx].state == SPRIXCELL_TRANSPARENT){
-              tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+            if(rgba_trans_p(*rgb, bargs->transcolor)){
+              if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
+                pthread_mutex_lock(&qs->lock);
+                tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+                pthread_mutex_unlock(&qs->lock);
+              }
+            }else{
+              if(tam[txyidx].state == SPRIXCELL_TRANSPARENT){
+                pthread_mutex_lock(&qs->lock);
+                tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
+                pthread_mutex_unlock(&qs->lock);
+              }
             }
           }
         }
       }
+//fprintf(stderr, "vis: %d/%d\n", visy, visx);
       firstpix = false;
       if(rgba_trans_p(*rgb, bargs->transcolor)){
         continue;
       }
+      pthread_mutex_lock(&qs->lock);
       if(insert_color(qs, *rgb, &qs->colors)){
+        pthread_mutex_unlock(&qs->lock);
         return -1;
       }
+      pthread_mutex_unlock(&qs->lock);
     }
   }
+  pthread_mutex_lock(&qs->lock);
   // if we're opaque, we needn't clear the old cell with a glyph
   if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
     rmatrix[txyidx] = 0;
   }else{
     stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
+  }
+  pthread_mutex_unlock(&qs->lock);
+  return 0;
+}
+
+// work on the active qstate until it's done. precondition: sengine->qs != NULL.
+static int
+qstate_work(sixel_engine* sengine){
+  qstate* qs = sengine->qs;
+  long cellid;
+  while((cellid = qs->cellstaken++) < qs->celly * qs->cellx){
+    if(extract_cell_color_table(cellid, qs->linesize, qs)){
+      return -1;
+    }
+    ++qs->cellsfinished;
+    // pthread_cond_signal(&qs->cond);
   }
   return 0;
 }
@@ -845,18 +919,19 @@ static inline int
 extract_color_table(const uint32_t* data, int linesize, int ccols,
                     int leny, int lenx, sixeltable* stab,
                     tament* tam, const blitterargs* bargs){
-  qstate qs;
-  if(alloc_qstate(bargs->u.pixel.colorregs, &qs)){
-    logerror("couldn't allocate qstate");
-    return -1;
-  }
-  const int begx = bargs->begx;
-  const int begy = bargs->begy;
-  const int cdimy = bargs->u.pixel.cellpxy;
-  const int cdimx = bargs->u.pixel.cellpxx;
   // use the cell geometry as computed by the visual layer; leny doesn't
   // include any mandatory sixel padding.
   const int crows = bargs->u.pixel.spx->dimy;
+  qstate qs;
+  if(alloc_qstate(bargs->u.pixel.colorregs, &qs, crows, ccols)){
+    logerror("couldn't allocate qstate");
+    return -1;
+  }
+  qs.bargs = bargs;
+  qs.linesize = linesize;
+  qs.data = data;
+  qs.tam = tam;
+  qs.stab = stab;
   typeof(bargs->u.pixel.spx->needs_refresh) rmatrix;
   rmatrix = malloc(sizeof(*rmatrix) * crows * ccols);
   if(rmatrix == NULL){
@@ -864,23 +939,24 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
     return -1;
   }
   bargs->u.pixel.spx->needs_refresh = rmatrix;
-  for(int y = 0 ; y < crows ; ++y){ // cell row
-    for(int x = 0 ; x < ccols ; ++x){ // cell column
-      if(extract_cell_color_table(y, x, ccols, cdimy, cdimx,
-                                  begy, begx, leny, lenx, linesize,
-                                  data, tam, bargs, stab, &qs)){
-        free_qstate(&qs);
-        return -1;
-      }
-    }
+  globsengine.qs = &qs;
+  pthread_cond_broadcast(&globsengine.cond);
+  if(qstate_work(&globsengine)){
+    free_qstate(&qs);
+    globsengine.qs = NULL;
+    // FIXME rigourize
+    return -1;
   }
+  while(qs.cellsfinished < crows * ccols){
+    ; // FIXME
+  }
+  globsengine.qs = NULL;
   loginfo("octree got %"PRIu32" entries", qs.colors);
   if(merge_color_table(&qs, stab->colorregs)){
     free_qstate(&qs);
     return -1;
   }
-  if(build_data_table(&qs, stab, data, linesize, begy, begx, leny, lenx,
-                      bargs->transcolor)){
+  if(build_data_table(&qs, stab, linesize, leny, lenx, bargs)){
     free_qstate(&qs);
     return -1;
   }
@@ -1268,21 +1344,6 @@ int sixel_draw(const tinfo* ti, const ncpile* p, sprixel* s, fbuf* f,
   return s->glyph.used;
 }
 
-// we keep a few worker threads spun up to assist with quantization.
-typedef struct sixel_engine {
-  // FIXME we'll want maybe one per core in our cpuset?
-  pthread_t tids[3];
-  unsigned workers;
-  unsigned workers_wanted;
-  pthread_mutex_t lock;
-  pthread_cond_t cond;
-  void* chunks; // FIXME
-  bool done;
-} sixel_engine;
-
-// FIXME make this part of the context, sheesh
-static sixel_engine globsengine;
-
 // a quantization worker. 
 static void *
 sixel_worker(void* v){
@@ -1295,20 +1356,20 @@ sixel_worker(void* v){
       logerror("couldn't spin up sixel worker %u", sengine->workers);
     }
   }else{
+    loginfo("spun up %d workers", globsengine.workers);
     pthread_mutex_unlock(&globsengine.lock);
   }
   do{
     pthread_mutex_lock(&sengine->lock);
-    while(sengine->chunks == NULL && !sengine->done){
+    while(sengine->qs == NULL && !sengine->done){
       pthread_cond_wait(&sengine->cond, &sengine->lock);
     }
     if(sengine->done){
       pthread_mutex_unlock(&sengine->lock);
       return NULL;
     }
-    // FIXME take workchunk
     pthread_mutex_unlock(&sengine->lock);
-    // FIXME handle workchunk
+    qstate_work(sengine);
   }while(1);
 }
 
@@ -1324,7 +1385,7 @@ int sixel_init(int fd){
   globsengine.workers_wanted = sizeof(globsengine.tids) / sizeof(*globsengine.tids);
   // don't fail on an error here
   if(pthread_create(globsengine.tids, NULL, sixel_worker, &globsengine)){
-    logerror("couldn't spin up sixel workers");
+    logerror("couldn't spin up %d sixel workers", globsengine.workers_wanted);
   }
   return tty_emit("\e[?80l\e[?8452h", fd);
 }
