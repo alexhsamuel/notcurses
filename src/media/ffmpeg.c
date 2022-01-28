@@ -580,8 +580,8 @@ ffmpeg_resize_internal(const ncvisual* ncv, int rows, int* stride, int cols,
     *stride = ncv->rowstride;
     return ncv->data;
   }
-  const int srclenx = bargs->lenx ? bargs->lenx : inframe->width;
-  const int srcleny = bargs->leny ? bargs->leny : inframe->height;
+  const int srclenx = bargs->srclenx ? bargs->srclenx : inframe->width;
+  const int srcleny = bargs->srcleny ? bargs->srcleny : inframe->height;
 //fprintf(stderr, "src %d/%d -> targ %d/%d ctx: %p\n", srcleny, srclenx, rows, cols, ncv->details->swsctx);
   ncv->details->swsctx = sws_getCachedContext(ncv->details->swsctx,
                                               srclenx, srcleny,

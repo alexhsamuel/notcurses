@@ -992,8 +992,8 @@ ncplane* ncvisual_render_cells(ncvisual* ncv, const struct blitset* bset,
   bargs.transcolor = transcolor;
   bargs.begy = geom->begy;
   bargs.begx = geom->begx;
-  bargs.leny = geom->leny;
-  bargs.lenx = geom->lenx;
+  bargs.srcleny = geom->leny;
+  bargs.srclenx = geom->lenx;
   bargs.flags = flags;
   bargs.u.cell.placey = placey;
   bargs.u.cell.placex = placex;
@@ -1030,8 +1030,8 @@ ncplane* ncvisual_render_pixels(notcurses* nc, ncvisual* ncv, const struct blits
   bargs.transcolor = transcolor;
   bargs.begy = geom->begy;
   bargs.begx = geom->begx;
-  bargs.leny = geom->leny;
-  bargs.lenx = geom->lenx;
+  bargs.srcleny = geom->leny;
+  bargs.srclenx = geom->lenx;
   bargs.flags = flags;
   bargs.u.pixel.colorregs = ti->color_registers;
   bargs.u.pixel.pxoffy = pxoffy;

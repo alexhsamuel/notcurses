@@ -371,8 +371,8 @@ typedef struct blitterargs {
   // consumed there, and blitters ought always work with the scaled output.
   int begy;            // upper left start within visual
   int begx;
-  int leny;            // number of source pixels to use
-  int lenx;
+  int srcleny;         // number of source pixels to use
+  int srclenx;
   uint64_t flags;      // flags (as selected from ncvisual_options->flags)
   uint32_t transcolor; // if non-zero, treat the lower 24 bits as a transparent color
   union { // cell vs pixel-specific arguments
