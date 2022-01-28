@@ -733,7 +733,7 @@ actionmap_bit(int cidx, int colors, int sixelrow){
 // once again, and get the actual final color table entries.
 static inline int
 build_data_table(qstate* qs, sixeltable* stab,
-                 int linesize, int leny, int lenx,
+                 int leny, int lenx,
                  const blitterargs* bargs){
   if(stab->map->sixelcount == 0){
     logerror("no sixels");
@@ -765,7 +765,7 @@ build_data_table(qstate* qs, sixeltable* stab,
   for(int visy = bargs->begy ; visy < (bargs->begy + leny) ; visy += 6){ // pixel row
     for(int visx = bargs->begx ; visx < (bargs->begx + lenx) ; visx += 1){ // pixel column
       for(int sy = visy ; sy < (bargs->begy + leny) && sy < visy + 6 ; ++sy){ // offset within sprixel
-        const uint32_t* rgb = (qs->data + (linesize / 4 * sy) + visx);
+        const uint32_t* rgb = (qs->data + (qs->linesize / 4 * sy) + visx);
         if(rgba_trans_p(*rgb, bargs->transcolor)){
           continue;
         }
@@ -793,7 +793,7 @@ build_data_table(qstate* qs, sixeltable* stab,
 // cell coordinates y/x inside the image. cell dimensions in pixels are
 // cdimy/cdimx. begy/leny/begx/lenx are all pixel geometries.
 static int
-extract_cell_color_table(long cellid, int linesize, qstate* qs){
+extract_cell_color_table(long cellid, qstate* qs){
   const blitterargs* bargs = qs->bargs;
   const int cdimx = bargs->u.pixel.cellpxx;
   const int cdimy = bargs->u.pixel.cellpxy;
@@ -824,8 +824,8 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
   // initialize as transparent, and otherwise as opaque. following that, any
   // transparent pixel takes opaque to mixed, and any filled pixel takes
   // transparent to mixed.
-//fprintf(stderr, "DATA: %p linesize: %d cstart: %d/%d txyidx: %d/%d tid: %lu\n", qs->data, linesize, cstarty, cstartx, txyidx, ccols, pthread_self());
-  const uint32_t* rgb = (qs->data + (linesize / 4 * cstarty) + cstartx);
+//fprintf(stderr, "DATA: %p linesize: %d cstart: %d/%d txyidx: %d/%d tid: %lu\n", qs->data, qs->linesize, cstarty, cstartx, txyidx, ccols, pthread_self());
+  const uint32_t* rgb = (qs->data + (qs->linesize / 4 * cstarty) + cstartx);
   // FIXME might need some locking in here depending on size of rmatrix/tam elements
   if((tam[txyidx].state == SPRIXCELL_ANNIHILATED) || (tam[txyidx].state == SPRIXCELL_ANNIHILATED_TRANS)){
     if(rgba_trans_p(*rgb, bargs->transcolor)){
@@ -849,7 +849,7 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
   }
   for(int visy = cstarty ; visy < cendy ; ++visy){   // current abs pixel row
     for(int visx = cstartx ; visx < cendx ; ++visx){ // current abs pixel col
-      rgb = (qs->data + (linesize / 4 * visy) + visx);
+      rgb = (qs->data + (qs->linesize / 4 * visy) + visx);
       // we do *not* exempt already-wiped pixels from palette creation. once
       // we're done, we'll call sixel_wipe() on these cells. so they remain
       // one of SPRIXCELL_ANNIHILATED or SPRIXCELL_ANNIHILATED_TRANS.
@@ -880,7 +880,7 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
   pthread_mutex_lock(&qs->lock);
   for(int visy = cstarty ; visy < cendy ; ++visy){   // current abs pixel row
     for(int visx = cstartx ; visx < cendx ; ++visx){ // current abs pixel col
-      rgb = (qs->data + (linesize / 4 * visy) + visx);
+      rgb = (qs->data + (qs->linesize / 4 * visy) + visx);
       if(rgba_trans_p(*rgb, bargs->transcolor)){
         continue;
       }
@@ -915,7 +915,7 @@ qstate_work(qstate* qs){
   pthread_mutex_lock(&qs->lock);
   while((cellid = qs->cellstaken++) < qs->celly * qs->cellx){
     pthread_mutex_unlock(&qs->lock);
-    if(extract_cell_color_table(cellid, qs->linesize, qs)){
+    if(extract_cell_color_table(cellid, qs)){
       // FIXME need a hard error!
       return NULL;
     }
@@ -980,7 +980,7 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
   if(merge_color_table(&qs, stab->colorregs)){
     goto err;
   }
-  if(build_data_table(&qs, stab, linesize, leny, lenx, bargs)){
+  if(build_data_table(&qs, stab, leny, lenx, bargs)){
     goto err;
   }
   loginfo("final palette: %u/%u colors", qs.colors, stab->colorregs);
