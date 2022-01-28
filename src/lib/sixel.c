@@ -80,6 +80,7 @@ typedef struct qstate {
   const uint32_t* data;
   tament* tam;
   struct sixeltable* stab;
+  int leny, lenx;
 } qstate;
 
 // we keep a few worker threads spun up to assist with quantization.
@@ -792,8 +793,8 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
   int ccols = qs->cellx;
   int begy = bargs->begy;
   int begx = bargs->begx;
-  int leny = bargs->leny;
-  int lenx = bargs->lenx;
+  int leny = qs->leny;
+  int lenx = qs->lenx;
   int y = cellid / ccols;
   int x = cellid % ccols;
 //fprintf(stderr, "CELLID %ld y/x: %d/%d cdim: %d/%d\n", cellid, y, x, cdimy, cdimx);
@@ -932,6 +933,8 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
   qs.data = data;
   qs.tam = tam;
   qs.stab = stab;
+  qs.leny = leny;
+  qs.lenx = lenx;
   typeof(bargs->u.pixel.spx->needs_refresh) rmatrix;
   rmatrix = malloc(sizeof(*rmatrix) * crows * ccols);
   if(rmatrix == NULL){
