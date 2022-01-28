@@ -3,7 +3,7 @@
 #include "fbuf.h"
 
 #define RGBSIZE 3
-#define POPULATION 1
+#define POPULATION 4
 
 // three scaled sixel [0..100x3] components plus a population count.
 typedef struct qsample {
@@ -61,9 +61,10 @@ qnode_keys(unsigned r, unsigned g, unsigned b, unsigned *skey){
 
 typedef struct qstate {
   pthread_mutex_t lock;
-  long cellstaken;            // when cellstaken == celly * cellx, block
+  pthread_cond_t cond;
+  long cellstaken;    // when cellstaken == celly * cellx, block
   // FIXME probably have to associate this with a condvar
-  _Atomic long cellsfinished; // when cellsfinished == celly * cellx, proceed
+  long cellsfinished; // when cellsfinished == celly * cellx, proceed
   _Atomic int population;     // live workers
   qnode* qnodes;
   onode* onodes;
@@ -80,9 +81,11 @@ typedef struct qstate {
   int linesize;      // line length in bytes
   const blitterargs* bargs;
   const uint32_t* data;
+  uint32_t nonce;
   tament* tam;
   struct sixeltable* stab;
   int leny, lenx;
+  struct qstate* next;
 } qstate;
 
 // we keep a few worker threads spun up to assist with quantization.
@@ -93,7 +96,8 @@ typedef struct sixel_engine {
   unsigned workers_wanted;
   pthread_mutex_t lock;
   pthread_cond_t cond;
-  qstate *qs; // FIXME need a queue
+  qstate* qs;
+  qstate** enq;
   bool done;
 } sixel_engine;
 
@@ -118,6 +122,8 @@ qidx(const qnode* q){
 }
 
 #define QNODECOUNT 1000
+
+static _Atomic uint32_t global_nonce;
 
 // create+zorch an array of QNODECOUNT qnodes. this is 1000 entries covering
 // 1000 sixel colors each (we pretend 100 doesn't exist, working on [0..99],
@@ -150,7 +156,11 @@ alloc_qstate(unsigned colorregs, qstate* qs, int crows, int ccols){
   qs->cellsfinished = 0;
   qs->celly = crows;
   qs->cellx = ccols;
+  if((qs->nonce = ++global_nonce) == 0){
+    qs->nonce = ++global_nonce;
+  }
   pthread_mutex_init(&qs->lock, NULL);
+  pthread_cond_init(&qs->cond, NULL);
   return 0;
 }
 
@@ -160,6 +170,7 @@ free_qstate(qstate *qs){
   if(qs){
     loginfo("freeing qstate");
     pthread_mutex_destroy(&qs->lock);
+    pthread_cond_destroy(&qs->cond);
     free(qs->qnodes);
     free(qs->onodes);
   }
@@ -255,7 +266,7 @@ find_color(const qstate* qs, uint32_t pixel){
     if(qs->onodes[q->qlink - 1].q[skey]){
       q = qs->onodes[q->qlink - 1].q[skey];
     }else{
-fprintf(stderr, "OH NOOOOOOOOOO %u:%u QLINK: %u\n", key, skey, q->qlink); // FIXME find one
+      logerror("internal error %u %u %u", key, skey, q->qlink);
       return -1;
     }
   }
@@ -759,7 +770,7 @@ build_data_table(qstate* qs, sixeltable* stab,
         }
         int cidx = find_color(qs, *rgb);
         if(cidx < 0){
-fprintf(stderr, "COUDLNT FIND THE COLOR\n");
+          logerror("internal error for 0x%08" PRIu32 "x", *rgb);
           free(stab->map->table);
           stab->map->table = NULL;
           free(stab->map->data);
@@ -838,9 +849,6 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
   for(int visy = cstarty ; visy < cendy ; ++visy){   // current abs pixel row
     for(int visx = cstartx ; visx < cendx ; ++visx){ // current abs pixel col
       rgb = (qs->data + (linesize / 4 * visy) + visx);
-      const unsigned r = ncpixel_r(*rgb);
-      const unsigned g = ncpixel_g(*rgb);
-      const unsigned b = ncpixel_b(*rgb);
       // we do *not* exempt already-wiped pixels from palette creation. once
       // we're done, we'll call sixel_wipe() on these cells. so they remain
       // one of SPRIXCELL_ANNIHILATED or SPRIXCELL_ANNIHILATED_TRANS.
@@ -866,21 +874,29 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
       }
 //fprintf(stderr, "vis: %d/%d\n", visy, visx);
       firstpix = false;
+    }
+  }
+  pthread_mutex_lock(&qs->lock);
+  for(int visy = cstarty ; visy < cendy ; ++visy){   // current abs pixel row
+    for(int visx = cstartx ; visx < cendx ; ++visx){ // current abs pixel col
+      rgb = (qs->data + (linesize / 4 * visy) + visx);
       if(rgba_trans_p(*rgb, bargs->transcolor)){
         continue;
       }
+      const unsigned r = ncpixel_r(*rgb);
+      const unsigned g = ncpixel_g(*rgb);
+      const unsigned b = ncpixel_b(*rgb);
       unsigned skey;
       const unsigned key = qnode_keys(r, g, b, &skey);
       assert(key < QNODECOUNT);
       assert(skey < 8);
-      pthread_mutex_lock(&qs->lock);
       if(insert_color(qs, key, skey, r, g, b)){
         pthread_mutex_unlock(&qs->lock);
         return -1;
       }
-      pthread_mutex_unlock(&qs->lock);
     }
   }
+  pthread_mutex_unlock(&qs->lock);
   // if we're opaque, we needn't clear the old cell with a glyph
   if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
     rmatrix[txyidx] = 0;
@@ -891,23 +907,29 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
 }
 
 // work on the active qstate until it's done. precondition: sengine->qs != NULL.
-static int
-qstate_work(sixel_engine* sengine){
-  qstate* qs = sengine->qs;
+// returns qs->next.
+static qstate*
+qstate_work(qstate* qs){
   long cellid;
   pthread_mutex_lock(&qs->lock);
   while((cellid = qs->cellstaken++) < qs->celly * qs->cellx){
     pthread_mutex_unlock(&qs->lock);
     if(extract_cell_color_table(cellid, qs->linesize, qs)){
-      return -1;
+      // FIXME need a hard error!
+      return NULL;
     }
-    ++qs->cellsfinished;
     // pthread_cond_signal(&qs->cond);
     pthread_mutex_lock(&qs->lock);
+    if(++qs->cellsfinished == qs->celly * qs->cellx){
+      pthread_cond_signal(&qs->cond);
+    }
   }
+  if(--qs->population == 0){
+    pthread_cond_signal(&qs->cond);
+  }
+  qstate* rqs = qs->next;
   pthread_mutex_unlock(&qs->lock);
-  --qs->population;
-  return 0;
+  return rqs;
 }
 
 // we have a 4096-element array that takes the 4-5-3 MSBs from the RGB
@@ -942,18 +964,17 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
     return -1;
   }
   bargs->u.pixel.spx->needs_refresh = rmatrix;
-  globsengine.qs = &qs;
-  pthread_cond_broadcast(&globsengine.cond);
-  if(qstate_work(&globsengine)){
-    free_qstate(&qs);
-    globsengine.qs = NULL;
-    // FIXME rigourize
-    return -1;
-  }
+  pthread_mutex_lock(&globsengine.lock);
+  *globsengine.enq = &qs;
+  globsengine.enq = &qs.next;
+  pthread_mutex_unlock(&globsengine.lock);
+  pthread_cond_broadcast(&globsengine.cond); // alert workers to this morsel
+  qstate_work(&qs);
+  pthread_mutex_lock(&qs.lock);
   while(qs.cellsfinished < crows * ccols){
-    ; // FIXME
+    pthread_cond_wait(&qs.cond, &qs.lock);
   }
-  globsengine.qs = NULL;
+  pthread_mutex_unlock(&qs.lock);
   loginfo("octree got %"PRIu32" entries", qs.colors);
   if(merge_color_table(&qs, stab->colorregs)){
     goto err;
@@ -962,19 +983,28 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
     goto err;
   }
   loginfo("final palette: %u/%u colors", qs.colors, stab->colorregs);
-  while(qs.population > 0){
-fprintf(stderr, "OPULATION: %d\n", qs.population);
-    // FIXME
+  pthread_mutex_lock(&qs.lock);
+  while(qs.population){
+    pthread_cond_wait(&qs.cond, &qs.lock);
   }
+  pthread_mutex_unlock(&qs.lock);
+  pthread_mutex_lock(&globsengine.lock);
+  if(globsengine.qs == &qs){
+    if((globsengine.qs = qs.next) == NULL){
+      globsengine.enq = &globsengine.qs;
+    }
+  }
+  pthread_mutex_unlock(&globsengine.lock);
   free_qstate(&qs);
   // FIXME how do we switch back to _OPAQUE once we've gone _TRANS?
   return 0;
 
 err:
-fprintf(stderr, "ARGFFFFFFFFF\n");
+  pthread_mutex_lock(&qs.lock);
   while(qs.population){
-    // FIXME
+    pthread_cond_wait(&qs.cond, &qs.lock);
   }
+  pthread_mutex_unlock(&qs.lock);
   free_qstate(&qs);
   return -1;
 }
@@ -1372,17 +1402,25 @@ sixel_worker(void* v){
     loginfo("spun up %d workers", globsengine.workers);
     pthread_mutex_unlock(&globsengine.lock);
   }
+  qstate* qs = NULL;
+  uint32_t count = 0;
   do{
     pthread_mutex_lock(&sengine->lock);
-    while(sengine->qs == NULL && !sengine->done){
+    while((sengine->qs == NULL || sengine->qs->nonce <= count) && !sengine->done){
       pthread_cond_wait(&sengine->cond, &sengine->lock);
     }
     if(sengine->done){
       pthread_mutex_unlock(&sengine->lock);
       return NULL;
     }
+    qs = sengine->qs;
     pthread_mutex_unlock(&sengine->lock);
-    qstate_work(sengine);
+    do{
+      if((count = qs->nonce) == 0xfffffffflu){
+        count = 0;
+      }
+      qs = qstate_work(qs);
+    }while(qs);
   }while(1);
 }
 
@@ -1396,7 +1434,8 @@ sixel_worker(void* v){
 int sixel_init(int fd){
   globsengine.workers = 0;
   globsengine.workers_wanted = sizeof(globsengine.tids) / sizeof(*globsengine.tids);
-  // don't fail on an error here
+  globsengine.enq = &globsengine.qs;
+  // don't fail on an error here...but DO reduce population FIXME
   if(pthread_create(globsengine.tids, NULL, sixel_worker, &globsengine)){
     logerror("couldn't spin up %d sixel workers", globsengine.workers_wanted);
   }
