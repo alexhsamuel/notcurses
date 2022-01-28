@@ -166,22 +166,16 @@ free_qstate(qstate *qs){
 }
 
 // insert a color from the source image into the octree.
-static int
-insert_color(qstate* qs, uint32_t pixel, uint32_t* colors){
-  const unsigned r = ncpixel_r(pixel);
-  const unsigned g = ncpixel_g(pixel);
-  const unsigned b = ncpixel_b(pixel);
-  unsigned skey;
-  const unsigned key = qnode_keys(r, g, b, &skey);
-  assert(key < QNODECOUNT);
-  assert(skey < 8);
+static inline int
+insert_color(qstate* qs, unsigned key, unsigned skey,
+             unsigned r, unsigned g, unsigned b){
   qnode* q = &qs->qnodes[key];
   if(q->q.pop == 0 && q->qlink == 0){ // previously-unused node
     q->q.comps[0] = r;
     q->q.comps[1] = g;
     q->q.comps[2] = b;
     q->q.pop = 1;
-    ++*colors;
+    ++qs->colors;
     return 0;
   }
   onode* o;
@@ -242,7 +236,7 @@ insert_color(qstate* qs, uint32_t pixel, uint32_t* colors){
   o->q[skey]->q.comps[2] = b;
   o->q[skey]->qlink = 0;
   o->q[skey]->cidx = 0;
-  ++*colors;
+  ++qs->colors;
 //fprintf(stderr, "INSERTED[%u]: %u %u %u\n", key, q->q.comps[0], q->q.comps[1], q->q.comps[2]);
   return 0;
 }
@@ -820,7 +814,7 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
   // transparent to mixed.
 //fprintf(stderr, "DATA: %p linesize: %d cstart: %d/%d txyidx: %d/%d tid: %lu\n", qs->data, linesize, cstarty, cstartx, txyidx, ccols, pthread_self());
   const uint32_t* rgb = (qs->data + (linesize / 4 * cstarty) + cstartx);
-  pthread_mutex_lock(&qs->lock);
+  // FIXME might need some locking in here depending on size of rmatrix/tam elements
   if((tam[txyidx].state == SPRIXCELL_ANNIHILATED) || (tam[txyidx].state == SPRIXCELL_ANNIHILATED_TRANS)){
     if(rgba_trans_p(*rgb, bargs->transcolor)){
       update_rmatrix(rmatrix, txyidx, tam);
@@ -841,10 +835,12 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
       tam[txyidx].state = SPRIXCELL_OPAQUE_SIXEL;
     }
   }
-  pthread_mutex_unlock(&qs->lock);
   for(int visy = cstarty ; visy < cendy ; ++visy){   // current abs pixel row
     for(int visx = cstartx ; visx < cendx ; ++visx){ // current abs pixel col
       rgb = (qs->data + (linesize / 4 * visy) + visx);
+      const unsigned r = ncpixel_r(*rgb);
+      const unsigned g = ncpixel_g(*rgb);
+      const unsigned b = ncpixel_b(*rgb);
       // we do *not* exempt already-wiped pixels from palette creation. once
       // we're done, we'll call sixel_wipe() on these cells. so they remain
       // one of SPRIXCELL_ANNIHILATED or SPRIXCELL_ANNIHILATED_TRANS.
@@ -852,23 +848,17 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
       if(tam[txyidx].state != SPRIXCELL_ANNIHILATED){
         if(tam[txyidx].state == SPRIXCELL_ANNIHILATED_TRANS){
           if(!rgba_trans_p(*rgb, bargs->transcolor)){
-            pthread_mutex_lock(&qs->lock);
             tam[txyidx].state = SPRIXCELL_ANNIHILATED;
-            pthread_mutex_unlock(&qs->lock);
           }
         }else{
           if(!firstpix){
             if(rgba_trans_p(*rgb, bargs->transcolor)){
               if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
-                pthread_mutex_lock(&qs->lock);
                 tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
-                pthread_mutex_unlock(&qs->lock);
               }
             }else{
               if(tam[txyidx].state == SPRIXCELL_TRANSPARENT){
-                pthread_mutex_lock(&qs->lock);
                 tam[txyidx].state = SPRIXCELL_MIXED_SIXEL;
-                pthread_mutex_unlock(&qs->lock);
               }
             }
           }
@@ -879,22 +869,24 @@ extract_cell_color_table(long cellid, int linesize, qstate* qs){
       if(rgba_trans_p(*rgb, bargs->transcolor)){
         continue;
       }
+      unsigned skey;
+      const unsigned key = qnode_keys(r, g, b, &skey);
+      assert(key < QNODECOUNT);
+      assert(skey < 8);
       pthread_mutex_lock(&qs->lock);
-      if(insert_color(qs, *rgb, &qs->colors)){
+      if(insert_color(qs, key, skey, r, g, b)){
         pthread_mutex_unlock(&qs->lock);
         return -1;
       }
       pthread_mutex_unlock(&qs->lock);
     }
   }
-  pthread_mutex_lock(&qs->lock);
   // if we're opaque, we needn't clear the old cell with a glyph
   if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
     rmatrix[txyidx] = 0;
   }else{
     stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
   }
-  pthread_mutex_unlock(&qs->lock);
   return 0;
 }
 
