@@ -3,6 +3,7 @@
 #include "fbuf.h"
 
 #define RGBSIZE 3
+#define POPULATION 1
 
 // three scaled sixel [0..100x3] components plus a population count.
 typedef struct qsample {
@@ -60,9 +61,10 @@ qnode_keys(unsigned r, unsigned g, unsigned b, unsigned *skey){
 
 typedef struct qstate {
   pthread_mutex_t lock;
-  _Atomic long cellstaken;    // when cellstaken == celly * cellx, block
+  long cellstaken;            // when cellstaken == celly * cellx, block
   // FIXME probably have to associate this with a condvar
   _Atomic long cellsfinished; // when cellsfinished == celly * cellx, proceed
+  _Atomic int population;     // live workers
   qnode* qnodes;
   onode* onodes;
   unsigned dynnodes_free;
@@ -86,7 +88,7 @@ typedef struct qstate {
 // we keep a few worker threads spun up to assist with quantization.
 typedef struct sixel_engine {
   // FIXME we'll want maybe one per core in our cpuset?
-  pthread_t tids[1];
+  pthread_t tids[POPULATION];
   unsigned workers;
   unsigned workers_wanted;
   pthread_mutex_t lock;
@@ -901,13 +903,18 @@ static int
 qstate_work(sixel_engine* sengine){
   qstate* qs = sengine->qs;
   long cellid;
+  pthread_mutex_lock(&qs->lock);
   while((cellid = qs->cellstaken++) < qs->celly * qs->cellx){
+    pthread_mutex_unlock(&qs->lock);
     if(extract_cell_color_table(cellid, qs->linesize, qs)){
       return -1;
     }
     ++qs->cellsfinished;
     // pthread_cond_signal(&qs->cond);
+    pthread_mutex_lock(&qs->lock);
   }
+  pthread_mutex_unlock(&qs->lock);
+  --qs->population;
   return 0;
 }
 
@@ -928,6 +935,7 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
     logerror("couldn't allocate qstate");
     return -1;
   }
+  qs.population = POPULATION + 1;
   qs.bargs = bargs;
   qs.linesize = linesize;
   qs.data = data;
@@ -956,17 +964,27 @@ extract_color_table(const uint32_t* data, int linesize, int ccols,
   globsengine.qs = NULL;
   loginfo("octree got %"PRIu32" entries", qs.colors);
   if(merge_color_table(&qs, stab->colorregs)){
-    free_qstate(&qs);
-    return -1;
+    goto err;
   }
   if(build_data_table(&qs, stab, linesize, leny, lenx, bargs)){
-    free_qstate(&qs);
-    return -1;
+    goto err;
   }
   loginfo("final palette: %u/%u colors", qs.colors, stab->colorregs);
+  while(qs.population > 0){
+fprintf(stderr, "OPULATION: %d\n", qs.population);
+    // FIXME
+  }
   free_qstate(&qs);
   // FIXME how do we switch back to _OPAQUE once we've gone _TRANS?
   return 0;
+
+err:
+fprintf(stderr, "ARGFFFFFFFFF\n");
+  while(qs.population){
+    // FIXME
+  }
+  free_qstate(&qs);
+  return -1;
 }
 
 // Emit some number of equivalent, subsequent sixels, using sixel RLE. We've
@@ -1387,9 +1405,9 @@ int sixel_init(int fd){
   globsengine.workers = 0;
   globsengine.workers_wanted = sizeof(globsengine.tids) / sizeof(*globsengine.tids);
   // don't fail on an error here
-  /*if(pthread_create(globsengine.tids, NULL, sixel_worker, &globsengine)){
+  if(pthread_create(globsengine.tids, NULL, sixel_worker, &globsengine)){
     logerror("couldn't spin up %d sixel workers", globsengine.workers_wanted);
-  }*/
+  }
   return tty_emit("\e[?80l\e[?8452h", fd);
 }
 

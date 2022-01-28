@@ -2539,6 +2539,7 @@ int stop_inputlayer(tinfo* ti){
     if(ti->ictx){
       loginfo("tearing down input thread");
       ret |= cancel_and_join("input", ti->ictx->tid, NULL);
+      loginfo("input thread is gone");
       ret |= set_fd_nonblocking(ti->ictx->stdinfd, ti->stdio_blocking_save, NULL);
       free_inputctx(ti->ictx);
       ti->ictx = NULL;
