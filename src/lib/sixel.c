@@ -1384,9 +1384,9 @@ int sixel_init(int fd){
   globsengine.workers = 0;
   globsengine.workers_wanted = sizeof(globsengine.tids) / sizeof(*globsengine.tids);
   // don't fail on an error here
-  if(pthread_create(globsengine.tids, NULL, sixel_worker, &globsengine)){
+  /*if(pthread_create(globsengine.tids, NULL, sixel_worker, &globsengine)){
     logerror("couldn't spin up %d sixel workers", globsengine.workers_wanted);
-  }
+  }*/
   return tty_emit("\e[?80l\e[?8452h", fd);
 }
 
