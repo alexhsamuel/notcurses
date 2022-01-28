@@ -3,7 +3,7 @@
 #include "fbuf.h"
 
 #define RGBSIZE 3
-#define POPULATION 4
+#define POPULATION 1
 
 // three scaled sixel [0..100x3] components plus a population count.
 typedef struct qsample {
@@ -181,18 +181,18 @@ static inline int
 insert_color(qstate* qs, unsigned key, unsigned skey,
              unsigned r, unsigned g, unsigned b){
   qnode* q = &qs->qnodes[key];
-  if(q->q.pop == 0 && q->qlink == 0){ // previously-unused node
-    q->q.comps[0] = r;
-    q->q.comps[1] = g;
-    q->q.comps[2] = b;
-    q->q.pop = 1;
-    ++qs->colors;
-    return 0;
-  }
   onode* o;
-  // it's not a fractured node, but it's been used. check to see if we
-  // match the secondary key of what's here.
   if(q->qlink == 0){
+    if(q->q.pop == 0){ // previously-unused node
+      q->q.comps[0] = r;
+      q->q.comps[1] = g;
+      q->q.comps[2] = b;
+      q->q.pop = 1;
+      ++qs->colors;
+      return 0;
+    }
+    // it's not a fractured node, but it's been used. check to see if we
+    // match the secondary key of what's here.
     unsigned skeynat;
     qnode_keys(q->q.comps[0], q->q.comps[1], q->q.comps[2], &skeynat);
     if(skey == skeynat){
@@ -205,6 +205,7 @@ insert_color(qstate* qs, unsigned key, unsigned skey,
     // it's a symmetry between creation and extension.
     if(qs->dynnodes_free == 0 || qs->onodes_free == 0){
 //fprintf(stderr, "NO FREE ONES %u\n", key);
+      // FIXME there might be a better match above/below
       ++q->q.pop; // not a great match, but we're already scattered
       return 0;
     }
@@ -266,7 +267,7 @@ find_color(const qstate* qs, uint32_t pixel){
     if(qs->onodes[q->qlink - 1].q[skey]){
       q = qs->onodes[q->qlink - 1].q[skey];
     }else{
-      logerror("internal error %u %u %u", key, skey, q->qlink);
+      logpanic("internal error %u %u %u", key, skey, q->qlink);
       return -1;
     }
   }
@@ -770,7 +771,7 @@ build_data_table(qstate* qs, sixeltable* stab,
         }
         int cidx = find_color(qs, *rgb);
         if(cidx < 0){
-          logerror("internal error for 0x%08" PRIu32 "x", *rgb);
+          logpanic("internal error for 0x%08" PRIu32 "x", *rgb);
           free(stab->map->table);
           stab->map->table = NULL;
           free(stab->map->data);
