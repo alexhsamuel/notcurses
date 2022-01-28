@@ -65,7 +65,7 @@ typedef struct qstate {
   long cellstaken;    // when cellstaken == celly * cellx, block
   // FIXME probably have to associate this with a condvar
   long cellsfinished; // when cellsfinished == celly * cellx, proceed
-  _Atomic int population;     // live workers
+  int population;     // live workers
   qnode* qnodes;
   onode* onodes;
   unsigned dynnodes_free;
