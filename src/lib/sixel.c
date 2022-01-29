@@ -795,7 +795,6 @@ extract_cell_color_table(long cellid, qstate* qs){
   const blitterargs* bargs = qs->bargs;
   const int cdimx = bargs->u.pixel.cellpxx;
   const int cdimy = bargs->u.pixel.cellpxy;
-  sixeltable* stab = qs->stab;
   int ccols = qs->cellx;
   int begy = bargs->begy;
   int begx = bargs->begx;
@@ -823,6 +822,12 @@ extract_cell_color_table(long cellid, qstate* qs){
   // transparent pixel takes opaque to mixed, and any filled pixel takes
   // transparent to mixed.
 //fprintf(stderr, "DATA: %p linesize: %d cstart: %d/%d txyidx: %d/%d tid: %lu\n", qs->data, qs->linesize, cstarty, cstartx, txyidx, ccols, pthread_self());
+  if(cstarty >= cendy){ // we're entirely transparent sixel overhead
+     tam[cellid].state = SPRIXCELL_TRANSPARENT;
+     qs->stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
+     // FIXME need we set rmatrix?
+     return 0;
+  }
   const uint32_t* rgb = (qs->data + (qs->linesize / 4 * cstarty) + cstartx);
   // FIXME might need some locking in here depending on size of rmatrix/tam elements
   if((tam[txyidx].state == SPRIXCELL_ANNIHILATED) || (tam[txyidx].state == SPRIXCELL_ANNIHILATED_TRANS)){
@@ -900,7 +905,7 @@ extract_cell_color_table(long cellid, qstate* qs){
   if(tam[txyidx].state == SPRIXCELL_OPAQUE_SIXEL){
     rmatrix[txyidx] = 0;
   }else{
-    stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
+    qs->stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
   }
   return 0;
 }
